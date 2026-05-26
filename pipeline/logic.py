@@ -70,7 +70,7 @@ def fall_detected(
     if (
         head_velocity >= velocity_threshold and
         head_distance >= distance_threshold and
-        aspect_ratio < ratio_threshold
+        aspect_ratio > ratio_threshold
     ):
         return True
     

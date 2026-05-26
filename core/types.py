@@ -12,7 +12,6 @@ class JointCoords:
     y: float
 
 
-
 @dataclass(frozen=True)
 class SkeletonFrame:
     """A frame containing skeleton data."""
