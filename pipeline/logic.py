@@ -30,7 +30,7 @@ def calc_velocity(
     return velocity
 
 def calc_aspect_ratio(frame : SkeletonFrame,) -> float:
-    """Calculate the aspect ratio of the skeleton frame."""
+    """Calc aspect ratio of skeleton frame."""
     joints = frame.joints
 
     head, hip = joints.get('head'), joints.get('mid_hip')
@@ -51,15 +51,15 @@ def calc_aspect_ratio(frame : SkeletonFrame,) -> float:
 def fall_detected(
         prev_frame: SkeletonFrame,
         curr_frame: SkeletonFrame,
-        velocity_threshold: float = 0.8, # pixels per milisecond
-        distance_threshold: float = 20.0, # pixels
+        velocity_threshold: float = 0.4, # pixels per milisecond
+        distance_threshold: float = 80.0, # pixels
         ratio_threshold: float = 2.0 # wide horizontal layout
 ) -> bool:
     """Fall threshold system (Velocity + Distance + Aspect Ratio)"""
 
     head_velocity = calc_velocity(prev_frame, curr_frame)
     if head_velocity is None:
-        return False  # Abort safely
+        return False  # abort safely
 
     prev_head = prev_frame.joints.get('head')
     curr_head = curr_frame.joints.get('head')
