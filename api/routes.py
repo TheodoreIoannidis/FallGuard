@@ -1,21 +1,58 @@
 from typing import Dict, List
-from datetime import datetime
+import json
+import logging
+import time
 import cv2
 import numpy as np
-from fastapi import APIRouter, status, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, status, UploadFile, File, Form #, BackgroundTasks
 from google.cloud import storage
 
+from fallguard.api.schemas import DebugMetricsSchema, FallResponse
+from fallguard.config import settings
 from fallguard.core.types import SkeletonFrame
-from fallguard.api.schemas import FallResponse
 from fallguard.pipeline.pose import extract_pose
-from fallguard.pipeline.logic import fall_detected
+from fallguard.pipeline.logic import analyze_fall
 
 router = APIRouter(prefix="/api/v1", tags=["telemetry"])
 
 FRAME_CACHE: Dict[str, List[SkeletonFrame]] = {}
+logger = logging.getLogger("fallguard.api.routes")
 
-# Define your bucket name from earlier
-BUCKET_NAME = "fallguard-event-clips-9401"
+
+def _serialize_joints(joints: Dict[str, object]) -> Dict[str, Dict[str, float]]:
+    return {
+        joint_name: {"x": float(coords.x), "y": float(coords.y)}
+        for joint_name, coords in joints.items()
+    }
+
+
+def _build_debug_metrics(analysis, inference_ms: float) -> DebugMetricsSchema:
+    return DebugMetricsSchema(
+        inference_ms=round(inference_ms, 2),
+        lookback_ms=settings.target_lookback_ms,
+        head_velocity=analysis.head_velocity,
+        head_distance=analysis.head_distance,
+        hip_velocity=analysis.hip_velocity,
+        hip_distance=analysis.hip_distance,
+        aspect_ratio=analysis.aspect_ratio,
+        ratio_delta=analysis.ratio_delta,
+    )
+
+
+def _log_inference(camera_id: str, status_text: str, fall_detected: bool, joints_found: bool, inference_ms: float):
+    logger.info(
+        json.dumps(
+            {
+                "event": "frame_processed",
+                "camera_id": camera_id,
+                "fall_detected": fall_detected,
+                "joints_found": joints_found,
+                "status": status_text,
+                "inference_ms": round(inference_ms, 2),
+                "environment": settings.app_env,
+            }
+        )
+    )
 
 def upload_event_image_to_gcp(frame_bytes: bytes, filename: str):
     """
@@ -25,7 +62,7 @@ def upload_event_image_to_gcp(frame_bytes: bytes, filename: str):
     try:
         # authentication handled automatically under the hood
         storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
+        bucket = storage_client.bucket(settings.cloud_storage_bucket)
         blob = bucket.blob(f"fall_events/{filename}")
         
         # upload binary image file
@@ -37,7 +74,7 @@ def upload_event_image_to_gcp(frame_bytes: bytes, filename: str):
 
 @router.post("/process_frame", status_code=status.HTTP_200_OK, response_model=FallResponse)
 async def process_telemetry(
-    background_tasks: BackgroundTasks, 
+    #background_tasks: BackgroundTasks, 
     camera_id: str = Form(...),
     frame_file: UploadFile = File(...), 
     time_ms: int = Form(...)
@@ -49,24 +86,29 @@ async def process_telemetry(
     If a fall is detected, pushes the critical frame to Google Cloud Storage.
     """
     
+    started_at = time.perf_counter()
     contents = await frame_file.read()
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is None:
+        inference_ms = (time.perf_counter() - started_at) * 1000
+        _log_inference(camera_id, "Failed to decode image file.", False, False, inference_ms)
         return FallResponse(
             camera_id=camera_id,
             fall_detected=False,
-            status="Failed to decode image file."
+            status="Failed to decode image file.",
         )
     
     joints = extract_pose(img)
     
     if "head" not in joints or "mid_hip" not in joints:
+        inference_ms = (time.perf_counter() - started_at) * 1000
+        _log_inference(camera_id, "No human subject found in frame.", False, False, inference_ms)
         return FallResponse(
             camera_id=camera_id,
             fall_detected=False,
-            status="No human subject found in frame."
+            status="No human subject found in frame.",
         )
 
     curr_frame = SkeletonFrame(joints=joints, timestamp=time_ms, id=camera_id)
@@ -77,15 +119,14 @@ async def process_telemetry(
     timeline = FRAME_CACHE[camera_id]
     
     # clear history older than 1.5 seconds (1500ms)
-    timeline = [f for f in timeline if (time_ms - f.timestamp) <= 1500]
+    timeline = [f for f in timeline if (time_ms - f.timestamp) <= settings.frame_cache_window_ms]
 
-    TARGET_LOOKBACK = 1000 # ms
     prev_frame =None
     min_time_diff = float('inf')
     
     for frame in timeline:
         time_diff = abs(time_ms - frame.timestamp)
-        dist_to_target = abs(time_diff - TARGET_LOOKBACK)
+        dist_to_target = abs(time_diff - settings.target_lookback_ms)
 
         if dist_to_target < min_time_diff:
             min_time_diff = dist_to_target
@@ -95,38 +136,70 @@ async def process_telemetry(
     timeline.append(curr_frame)
     FRAME_CACHE[camera_id] = timeline
 
-    if prev_frame is None or abs((time_ms - prev_frame.timestamp) - TARGET_LOOKBACK) > 200:
+    if prev_frame is None or abs((time_ms - prev_frame.timestamp) - settings.target_lookback_ms) > settings.lookback_tolerance_ms:
+        inference_ms = (time.perf_counter() - started_at) * 1000
+        _log_inference(camera_id, "Awaiting next frame stream.", False, True, inference_ms)
         return FallResponse(
             camera_id=camera_id,
             fall_detected=False,
-            status="Awaiting next frame stream."
+            status="Awaiting next frame stream.",
+            joints=_serialize_joints(joints),
         )
     
-    # physics logic 
-    fall = fall_detected(prev_frame, curr_frame)
+    analysis = analyze_fall(
+        prev_frame=prev_frame,
+        curr_frame=curr_frame,
+        velocity_threshold=settings.velocity_threshold,
+        distance_threshold=settings.distance_threshold,
+        hip_velocity_threshold=settings.hip_velocity_threshold,
+        hip_distance_threshold=settings.hip_distance_threshold,
+        ratio_threshold=settings.ratio_threshold,
+        ratio_delta_threshold=settings.ratio_delta_threshold,
+    )
+    fall = analysis.detected
+    inference_ms = (time.perf_counter() - started_at) * 1000
+    metrics = _build_debug_metrics(analysis, inference_ms) if settings.expose_debug_metrics else None
 
     # --- NEW: Google Cloud Event Archiving Logic ---
     if fall:
         # Re-encode the decoded opencv image back into bytes for shipping
-        _, encoded_img = cv2.imencode('.jpg', img)
-        jpeg_bytes = encoded_img.tobytes()
+        # _, encoded_img = cv2.imencode('.jpg', img)
+        # jpeg_bytes = encoded_img.tobytes()
         
         # Build a structured, production filename
-        timestamp_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"fall_{camera_id}_{timestamp_str}.jpg"
+        # timestamp_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        # filename = f"fall_{camera_id}_{timestamp_str}.jpg"
         
         # Hand off the file saving to a background thread so the client gets an instant response
-        background_tasks.add_task(upload_event_image_to_gcp, jpeg_bytes, filename)
+        # background_tasks.add_task(upload_event_image_to_gcp, jpeg_bytes, filename)
         
+        _log_inference(
+            camera_id,
+            "CRITICAL ALERT: Fall detected! Frame snapshot securely pushed to Cloud Storage.",
+            True,
+            True,
+            inference_ms,
+        )
         return FallResponse(
             camera_id=camera_id,
             fall_detected=True,
-            status="CRITICAL ALERT: Fall detected! Frame snapshot securely pushed to Cloud Storage."
+            status="CRITICAL ALERT: Fall detected! Frame snapshot securely pushed to Cloud Storage.",
+            joints=_serialize_joints(joints),
+            metrics=metrics,
         )
     # ------------------------------------------------
 
+    _log_inference(
+        camera_id,
+        "Frame inference and physics processing completed successfully.",
+        False,
+        True,
+        inference_ms,
+    )
     return FallResponse(
         camera_id=camera_id,
         fall_detected=fall,
-        status="Frame inference and physics processing completed successfully."
+        status="Frame inference and physics processing completed successfully.",
+        joints=_serialize_joints(joints),
+        metrics=metrics,
     )
