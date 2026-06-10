@@ -20,6 +20,9 @@ class Settings:
     app_env: str
     cors_allowed_origins: List[str]
     cloud_storage_bucket: str
+    max_upload_bytes: int
+    max_camera_id_length: int
+    max_active_cameras: int
     frame_cache_window_ms: int
     target_lookback_ms: int
     lookback_tolerance_ms: int
@@ -40,10 +43,13 @@ def get_settings() -> Settings:
         cors_allowed_origins=_parse_csv(
             os.getenv(
                 "FALLGUARD_CORS_ALLOWED_ORIGINS",
-                "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+                "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,https://fallguard-frontend-1054611845093.europe-west4.run.app",
             )
         ),
         cloud_storage_bucket=os.getenv("FALLGUARD_CLOUD_STORAGE_BUCKET", "fallguard-event-clips-9401"),
+        max_upload_bytes=int(os.getenv("FALLGUARD_MAX_UPLOAD_BYTES", "2097152")),
+        max_camera_id_length=int(os.getenv("FALLGUARD_MAX_CAMERA_ID_LENGTH", "128")),
+        max_active_cameras=int(os.getenv("FALLGUARD_MAX_ACTIVE_CAMERAS", "256")),
         frame_cache_window_ms=int(os.getenv("FALLGUARD_FRAME_CACHE_WINDOW_MS", "1500")),
         target_lookback_ms=int(os.getenv("FALLGUARD_TARGET_LOOKBACK_MS", "1000")),
         lookback_tolerance_ms=int(os.getenv("FALLGUARD_LOOKBACK_TOLERANCE_MS", "200")),

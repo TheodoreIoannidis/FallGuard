@@ -1,0 +1,11 @@
+services:
+  fallguard:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+    # For local development with hot reload (optional)
+    # volumes:
+    #   - ./fallguard:/app/fallguard
+    #   - ./main.py:/app/main.py

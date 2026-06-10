@@ -4,7 +4,7 @@ import logging
 import time
 import cv2
 import numpy as np
-from fastapi import APIRouter, status, UploadFile, File, Form #, BackgroundTasks
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form #, BackgroundTasks
 from google.cloud import storage
 
 from fallguard.api.schemas import DebugMetricsSchema, FallResponse
@@ -17,6 +17,46 @@ router = APIRouter(prefix="/api/v1", tags=["telemetry"])
 
 FRAME_CACHE: Dict[str, List[SkeletonFrame]] = {}
 logger = logging.getLogger("fallguard.api.routes")
+
+
+def _prune_frame_cache(current_time_ms: int) -> None:
+    stale_camera_ids = [
+        camera_id
+        for camera_id, frames in FRAME_CACHE.items()
+        if not frames or (current_time_ms - frames[-1].timestamp) > settings.frame_cache_window_ms
+    ]
+    for camera_id in stale_camera_ids:
+        FRAME_CACHE.pop(camera_id, None)
+
+    if len(FRAME_CACHE) <= settings.max_active_cameras:
+        return
+
+    cameras_by_last_seen = sorted(
+        FRAME_CACHE.items(),
+        key=lambda entry: entry[1][-1].timestamp if entry[1] else -1,
+    )
+    overflow_count = len(FRAME_CACHE) - settings.max_active_cameras
+    for camera_id, _ in cameras_by_last_seen[:overflow_count]:
+        FRAME_CACHE.pop(camera_id, None)
+
+
+def _validate_request(camera_id: str, time_ms: int, frame_file: UploadFile) -> None:
+    normalized_camera_id = camera_id.strip()
+    if not normalized_camera_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="camera_id cannot be empty")
+
+    if len(normalized_camera_id) > settings.max_camera_id_length:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"camera_id exceeds {settings.max_camera_id_length} characters",
+        )
+
+    if time_ms <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="time_ms must be positive")
+
+    content_type = frame_file.content_type or ""
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="frame_file must be an image upload")
 
 
 def _serialize_joints(joints: Dict[str, object]) -> Dict[str, Dict[str, float]]:
@@ -86,8 +126,19 @@ async def process_telemetry(
     If a fall is detected, pushes the critical frame to Google Cloud Storage.
     """
     
+    _validate_request(camera_id, time_ms, frame_file)
+    camera_id = camera_id.strip()
+    _prune_frame_cache(time_ms)
+
     started_at = time.perf_counter()
-    contents = await frame_file.read()
+    contents = await frame_file.read(settings.max_upload_bytes + 1)
+
+    if len(contents) > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"frame_file exceeds {settings.max_upload_bytes} bytes",
+        )
+
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
